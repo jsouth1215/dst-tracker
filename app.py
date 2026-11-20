@@ -98,21 +98,37 @@ def inject_styles() -> None:
         header[data-testid="stHeader"] a {
             pointer-events: auto;
         }
-        div[data-testid="stButtonGroup"] {
-            width: 100%;
+        .st-key-active_mode,
+        .st-key-active_mode > div,
+        div[data-testid="stButtonGroup"],
+        div[data-testid="stButtonGroup"] > div {
+            width: 100% !important;
+            max-width: 100% !important;
         }
         div[data-testid="stButtonGroup"] > div {
-            width: 100%;
-            display: flex;
+            display: flex !important;
             gap: 6px;
         }
         div[data-testid="stButtonGroup"] button {
-            flex: 1 1 0;
+            flex: 1 1 auto !important;
+            min-width: fit-content !important;
             min-height: 44px;
+            padding: 0 12px !important;
             font-size: 0.9rem;
             font-weight: 700;
             cursor: pointer;
             touch-action: manipulation;
+        }
+        div[data-testid="stButtonGroup"] button * {
+            overflow: visible !important;
+            text-overflow: clip !important;
+            white-space: nowrap !important;
+        }
+        @media (max-width: 480px) {
+            div[data-testid="stButtonGroup"] button {
+                padding: 0 8px !important;
+                font-size: 0.82rem;
+            }
         }
         div[data-testid="stRadio"] label {
             padding: 6px 10px;
