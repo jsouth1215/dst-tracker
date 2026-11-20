@@ -85,12 +85,40 @@ def inject_styles() -> None:
         <style>
         .block-container {
             max-width: 740px;
-            padding-top: 0.9rem;
+            padding-top: 2.2rem;
             padding-bottom: 2.5rem;
             padding-left: 0.85rem;
             padding-right: 0.85rem;
         }
-        header[data-testid="stHeader"] { background: transparent; }
+        header[data-testid="stHeader"] {
+            background: transparent;
+            pointer-events: none;
+        }
+        header[data-testid="stHeader"] button,
+        header[data-testid="stHeader"] a {
+            pointer-events: auto;
+        }
+        div[data-testid="stButtonGroup"] {
+            width: 100%;
+        }
+        div[data-testid="stButtonGroup"] > div {
+            width: 100%;
+            display: flex;
+            gap: 6px;
+        }
+        div[data-testid="stButtonGroup"] button {
+            flex: 1 1 0;
+            min-height: 44px;
+            font-size: 0.9rem;
+            font-weight: 700;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        div[data-testid="stRadio"] label {
+            padding: 6px 10px;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
         .dst-card {
             background: #111827;
             border: 1px solid #1f2937;
@@ -1052,18 +1080,38 @@ def render_scoring_reference() -> None:
 def main() -> None:
     inject_styles()
 
-    if "pending_mode" in st.session_state:
-        st.session_state["active_mode"] = st.session_state.pop("pending_mode")
-    elif "active_mode" not in st.session_state:
-        st.session_state["active_mode"] = "Live Game"
+    modes = ["Live Game", "Game Replay", "Sandbox"]
+    if "last_valid_mode" not in st.session_state:
+        st.session_state["last_valid_mode"] = "Live Game"
 
-    mode = st.radio(
-        "Mode",
-        ["Live Game", "Game Replay", "Sandbox"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="active_mode",
-    )
+    if "pending_mode" in st.session_state:
+        target = st.session_state.pop("pending_mode")
+        st.session_state["active_mode"] = target
+        st.session_state["last_valid_mode"] = target
+    elif st.session_state.get("active_mode") not in modes:
+        st.session_state["active_mode"] = st.session_state["last_valid_mode"]
+
+    if hasattr(st, "segmented_control"):
+        mode = st.segmented_control(
+            "Mode",
+            modes,
+            selection_mode="single",
+            label_visibility="collapsed",
+            key="active_mode",
+        )
+        if mode is None:
+            st.session_state["pending_mode"] = st.session_state["last_valid_mode"]
+            st.rerun()
+    else:
+        mode = st.radio(
+            "Mode",
+            modes,
+            horizontal=True,
+            label_visibility="collapsed",
+            key="active_mode",
+        )
+
+    st.session_state["last_valid_mode"] = mode
 
     if mode == "Live Game":
         render_live_mode()
