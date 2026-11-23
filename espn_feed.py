@@ -47,6 +47,7 @@ NON_SCRIMMAGE_TYPES = {
     "Kickoff Return Touchdown",
     "Punt",
     "Punt Return Touchdown",
+    "Muffed Punt Recovery (Opponent)",
     "Blocked Punt",
     "Blocked Punt Touchdown",
     "Field Goal Good",
@@ -205,6 +206,57 @@ def _all_drives_plays(summary: dict) -> list[tuple[dict, dict]]:
     return out
 
 
+def _effective_play_text(text: str) -> str:
+    """If a play was reversed on replay, keep only the official post-REVERSED ruling."""
+    if not text:
+        return ""
+    if "REVERSED." in text:
+        return text.rsplit("REVERSED.", 1)[1].strip()
+    if "REVERSED" in text:
+        return text.rsplit("REVERSED", 1)[1].lstrip(". ").strip()
+    return text
+
+
+def _strip_try_attempt(text: str) -> str:
+    """
+    Removes appended 2-point conversion attempt text from TD plays.
+    Per NFL statistician rules, sacks/INTs/fumbles on try attempts do not count as official stats.
+    """
+    if not text:
+        return ""
+    return re.split(r"\bTWO-POINT CONVERSION ATTEMPT\b", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+
+def _play_was_nullified(text_l: str) -> bool:
+    return (
+        "no play" in text_l
+        or "nullified by penalty" in text_l
+        or "offsetting" in text_l
+    )
+
+
+def _is_unrecovered_fumble_touchback(play: dict, drive_team_id: str, opp_id: str) -> bool:
+    """
+    NFL counts a fumble out of bounds through the end zone for a touchback as an offensive
+    fumble lost, but no defender recovers the ball so ESPN D/ST awards 0 FR points.
+    """
+    if str(drive_team_id) != str(opp_id):
+        return False
+    text = _strip_try_attempt(_effective_play_text(play.get("text", "") or ""))
+    text_l = text.lower()
+    if _play_was_nullified(text_l):
+        return False
+    if "fumble" not in text_l and "muff" not in text_l:
+        return False
+    tail = re.split(r"\bfumbles?\b|\bmuffs?\b", text_l)[-1]
+    return (
+        "out of bounds" in tail
+        and "end zone" in tail
+        and "touchback" in tail
+        and "recovered by" not in tail
+    )
+
+
 def _classify_opponent_scoring_exclusion(play_type: str, text: str) -> tuple[int, Optional[str]]:
     """
     Standard ESPN D/ST rules:
@@ -283,7 +335,7 @@ def parse_live_game(summary: dict, defense_team_id: str) -> GameSnapshot:
     yards_allowed = _to_int(opp_stats_map.get("totalYards", 0))
     sacks = float(_parse_sacks_from_str(opp_stats_map.get("sacksYardsLost", "0-0")))
     interceptions = _to_int(opp_stats_map.get("interceptions", 0))
-    fumble_recoveries = _to_int(opp_stats_map.get("fumblesLost", 0))
+    box_fumbles_lost = _to_int(opp_stats_map.get("fumblesLost", 0))
 
     dst_tds = 0
     safeties = 0
@@ -318,6 +370,7 @@ def parse_live_game(summary: dict, defense_team_id: str) -> GameSnapshot:
                     excluded_notes.append(note)
 
     blocked_kicks = 0
+    unrecovered_fumble_touchbacks = 0
     all_plays = _all_drives_plays(summary)
     for drive, play in all_plays:
         drive_team_id = str(drive.get("team", {}).get("id", ""))
@@ -328,6 +381,10 @@ def parse_live_game(summary: dict, defense_team_id: str) -> GameSnapshot:
             play.get("text", ""),
         ):
             blocked_kicks += 1
+        if _is_unrecovered_fumble_touchback(play, drive_team_id, opp_id):
+            unrecovered_fumble_touchbacks += 1
+
+    fumble_recoveries = max(0, box_fumbles_lost - unrecovered_fumble_touchbacks)
 
     down_distance = ""
     possession_abbr: Optional[str] = None
@@ -389,56 +446,27 @@ def parse_live_game(summary: dict, defense_team_id: str) -> GameSnapshot:
     )
 
 
-def _effective_play_text(text: str) -> str:
-    """If a play was reversed on replay, keep only the official post-REVERSED ruling."""
-    if not text:
-        return ""
-    if "REVERSED." in text:
-        return text.rsplit("REVERSED.", 1)[1].strip()
-    if "REVERSED" in text:
-        return text.rsplit("REVERSED", 1)[1].lstrip(". ").strip()
-    return text
-
-
-def _play_was_nullified(text_l: str) -> bool:
-    return (
-        "no play" in text_l
-        or "nullified by penalty" in text_l
-        or "offsetting" in text_l
-    )
-
-
 def _parse_scrimmage_yards_from_text(text: str) -> Optional[int]:
     """
     Extracts net offensive scrimmage yards (including laterals and sack losses)
     from the pre-penalty, pre-turnover segment of ESPN play-by-play text.
     """
-    # Strip any trailing penalty clause
     base = re.split(r"\bPENALTY\b|\bPenalty on\b", text, maxsplit=1)[0]
-    # Strip anything after FUMBLES or INTERCEPTED (return yardage is not offensive yardage)
     base = re.split(r"\bFUMBLES\b|\bINTERCEPTED\b", base, maxsplit=1)[0]
 
-    # Sack loss pattern: "sacked at SEA 42 for -6 yards" or "sacked ... for a loss of 6 yards"
     if "sacked" in base.lower():
         m_neg = re.search(r"for\s+(-?\d+)\s+yard", base, re.IGNORECASE)
         if m_neg:
-            val = int(m_neg.group(1))
-            return -abs(val)
+            return -abs(int(m_neg.group(1)))
         m_loss = re.search(r"loss of\s+(\d+)\s+yard", base, re.IGNORECASE)
         if m_loss:
             return -abs(int(m_loss.group(1)))
-        if "no gain" in base.lower():
-            return 0
         return 0
 
-    # Sum all "for X yard(s)" / "for no gain" segments (handles laterals cleanly)
     matches = re.findall(r"\bfor\s+(?:(-?\d+)\s+yard|no gain)", base, re.IGNORECASE)
     if not matches:
         return None
-    total = 0
-    for m in matches:
-        total += int(m) if m else 0
-    return total
+    return sum(int(m) if m else 0 for m in matches)
 
 
 def _extract_scrimmage_yards_from_play(play: dict, drive_team_id: str, opp_id: str) -> int:
@@ -450,7 +478,7 @@ def _extract_scrimmage_yards_from_play(play: dict, drive_team_id: str, opp_id: s
         return 0
 
     ptype = play.get("type", {}).get("text", "")
-    text = _effective_play_text(play.get("text", "") or "")
+    text = _strip_try_attempt(_effective_play_text(play.get("text", "") or ""))
     text_l = text.lower()
 
     if ptype in NON_SCRIMMAGE_TYPES:
@@ -464,12 +492,10 @@ def _extract_scrimmage_yards_from_play(play: dict, drive_team_id: str, opp_id: s
 
     is_pen = bool(play.get("isPenalty"))
 
-    # If ESPN labeled the play "Penalty" without "No Play" (e.g., dead-ball or declined penalty after a gain)
     if ptype == "Penalty":
         if "pass incomplete" in text_l or text_l.lstrip().startswith("penalty"):
             return 0
         if "declined" in text_l or "enforced between downs" in text_l or "enforced at" in text_l:
-            # Check if a real rush/pass/sack occurred before the penalty sentence
             pre_pen = re.split(r"\bPENALTY\b|\bPenalty on\b", text, maxsplit=1)[0].lower()
             if any(k in pre_pen for k in ("pass ", "sacked", "scrambles", "up the middle", "left ", "right ", "guard", "tackle", "end ")):
                 parsed = _parse_scrimmage_yards_from_text(text)
@@ -477,8 +503,6 @@ def _extract_scrimmage_yards_from_play(play: dict, drive_team_id: str, opp_id: s
                     return parsed
         return 0
 
-    # Strip-sacks, opponent fumble recoveries, lateral plays, or scrimmage plays with post-play penalties:
-    # parse directly from the scrimmage portion of the text so penalty/return yards don't skew statYardage.
     if ptype == "Fumble Recovery (Own)" and not is_pen:
         return _to_int(play.get("statYardage", 0))
 
@@ -514,32 +538,23 @@ def _count_fumble_recoveries_by_defense(
     opp_aliases: set[str],
 ) -> int:
     """
-    Counts fumbles lost by the opponent (recovered by our D/ST) on any play,
-    including strip-sacks, muffed punts/kicks, and interception-fumbles.
+    Counts fumbles/muffs lost by the opponent and actually recovered by our D/ST
+    (strip-sacks, muffed punts/kicks, INT-fumbles). Excludes unrecovered touchbacks.
     """
-    text = _effective_play_text(play.get("text", "") or "")
+    text = _strip_try_attempt(_effective_play_text(play.get("text", "") or ""))
     text_l = text.lower()
-    if "fumble" not in text_l or _play_was_nullified(text_l):
+    if ("fumble" not in text_l and "muff" not in text_l) or _play_was_nullified(text_l):
         return 0
 
-    # Match every "RECOVERED by TEAM-" occurrence (case-insensitive)
     recs = [m.upper() for m in re.findall(r"recovered by\s+([A-Z]{2,3})-", text, re.IGNORECASE)]
     if not recs:
         return 0
 
-    # Walk possession through the play to verify it was an opponent fumble recovered by defense
-    # Normal case on opponent drive: opponent has ball -> fumbles -> defense recovers
-    # Special case: interception on opponent drive flips ball to defense first; if defense fumbles,
-    # opponent recovers (not a fumble lost by opponent!).
-    # Special case on defense drive: defense punts/kicks -> opponent returns & fumbles -> defense recovers!
     # ESPN attaches Kickoffs to the RECEIVING team's drive, and Punts to the PUNTING team's drive.
     # So possession flips on Punts and INTs, but NOT on Kickoffs.
     has_int = "intercepted" in text_l
-    is_punt = play.get("type", {}).get("text", "") in (
-        "Punt",
-        "Blocked Punt",
-        "Punt Return Touchdown",
-    )
+    ptype_l = (play.get("type", {}).get("text", "") or "").lower()
+    is_punt = "punt" in ptype_l or "punts " in text_l
     poss_flipped = has_int or is_punt
 
     if str(drive_team_id) == str(opp_id):
@@ -556,8 +571,6 @@ def _count_fumble_recoveries_by_defense(
             count += 1
         holder_is_opp = not r_is_def
     return count
-
-    return 0
 
 
 def build_replay_snapshots(summary: dict, defense_team_id: str) -> list[GameSnapshot]:
@@ -624,8 +637,9 @@ def build_replay_snapshots(summary: dict, defense_team_id: str) -> list[GameSnap
         ptype = play.get("type", {}).get("text", "")
         raw_text = play.get("text", "") or ""
         text = _effective_play_text(raw_text)
-        text_l = text.lower()
-        nullified = _play_was_nullified(text_l)
+        stat_text = _strip_try_attempt(text)
+        stat_text_l = stat_text.lower()
+        nullified = _play_was_nullified(stat_text_l)
 
         away_sc = _to_int(play.get("awayScore", 0))
         home_sc = _to_int(play.get("homeScore", 0))
@@ -637,17 +651,16 @@ def build_replay_snapshots(summary: dict, defense_team_id: str) -> list[GameSnap
 
         # Sacks against opponent offense
         if drive_team_id == opp_id and not nullified:
-            if ptype in ("Sack", "Sack Opp Fumble Recovery") or "sacked" in text_l:
-                # Ignore if sacked text appeared inside a nullified/penalty-only play
-                if not (ptype == "Penalty" and "declined" not in text_l and "enforced between" not in text_l):
+            if ptype in ("Sack", "Sack Opp Fumble Recovery") or "sacked" in stat_text_l:
+                if not (ptype == "Penalty" and "declined" not in stat_text_l and "enforced between" not in stat_text_l):
                     sacks += 1.0
 
-        # Interceptions by defense (even if play type changed due to post-INT fumble)
+        # Interceptions by defense (excludes 2-point conversion try interceptions)
         if drive_team_id == opp_id and not nullified:
-            if "interception" in ptype.lower() or "intercepted" in text_l:
+            if "interception" in ptype.lower() or "intercepted" in stat_text_l:
                 ints += 1
 
-        # Fumble recoveries by defense (handles strip-sacks, muffed punts/kicks, INT-fumbles)
+        # Fumble & muffed kick/punt recoveries by defense
         fumble_recs += _count_fumble_recoveries_by_defense(
             play, drive_team_id, def_id, opp_id, def_aliases, opp_aliases
         )
